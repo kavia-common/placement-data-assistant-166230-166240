@@ -3,7 +3,7 @@ import json
 import logging
 from typing import List, Optional, Dict, Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
@@ -22,13 +22,16 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 SITE_URL = os.getenv("SITE_URL", "http://localhost:3000")  # used in docs and CORS
 
 # Model/Service constants
-EMBEDDING_MODEL = "llama-text-embed-v2"  # Vercel AI or Replicate style name; we'll call OpenRouter embeddings endpoint compat
-GENERATION_MODEL = "openrouter/gpt-oss-20b"  # As requested: gpt-oss-20b via OpenRouter
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "meta-llama/llama-text-embed-v2")
+GENERATION_MODEL = os.getenv("GENERATION_MODEL", "openrouter/gpt-oss-20b")  # default; can be overridden in .env
 TOP_K = 3
 FALLBACK_ANSWER = "I don’t have information about that in the placement records."
 
 # Logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
 logger = logging.getLogger("connecto-backend")
 
 # PUBLIC_INTERFACE
@@ -81,8 +84,9 @@ def _require_env(var: str) -> None:
     if not os.getenv(var):
         logger.warning(f"Environment variable {var} is not set. Please configure it in .env.")
 
-for v in ["PINECONE_API_KEY", "PINECONE_INDEX_NAME", "OPENROUTER_API_KEY"]:
+for v in ["PINECONE_API_KEY", "PINECONE_INDEX_NAME", "OPENROUTER_API_KEY", "PINECONE_HOST"]:
     _require_env(v)
+logger.info(f"Pinecone host configured: {bool(PINECONE_HOST)} | Index: {PINECONE_INDEX_NAME} | TopK default: {TOP_K}")
 
 # Embedding: Using OpenRouter embeddings endpoint for llama-text-embed-v2, if available.
 # PUBLIC_INTERFACE
@@ -98,9 +102,10 @@ async def embed_texts(texts: List[str]) -> List[List[float]]:
     }
     url = "https://openrouter.ai/api/v1/embeddings"
     payload = {
-        "model": "meta-llama/llama-text-embed-v2",  # explicit for OpenRouter catalog
+        "model": EMBEDDING_MODEL,
         "input": texts,
     }
+    logger.info(f"Embedding request: model={EMBEDDING_MODEL} | batch_size={len(texts)}")
     try:
         async with httpx.AsyncClient(timeout=60) as client:
             resp = await client.post(url, headers=headers, json=payload)
@@ -161,6 +166,7 @@ async def _pinecone_query(vector: List[float], top_k: int) -> List[Dict[str, Any
         raise HTTPException(status_code=500, detail="PINECONE_HOST not set. Please set PINECONE_HOST for your index endpoint.")
 
     payload = {"vector": vector, "topK": int(top_k), "includeMetadata": True}
+    logger.info(f"Pinecone query -> host={PINECONE_HOST} topK={int(top_k)} dim={len(vector)}")
     try:
         async with httpx.AsyncClient(timeout=60) as client:
             resp = await client.post(url, headers=_pinecone_headers(), json=payload)
@@ -169,8 +175,20 @@ async def _pinecone_query(vector: List[float], top_k: int) -> List[Dict[str, Any
                 raise HTTPException(status_code=502, detail="Pinecone query error")
             data = resp.json()
             matches = data.get("matches", [])
-            # Normalize to list of {id, score, metadata}
-            return matches
+            logger.info(f"Pinecone matches received: {len(matches)}")
+            # Normalize to list of {id, score, metadata}; ensure score is numeric if present
+            norm_matches: List[Dict[str, Any]] = []
+            for m in matches:
+                score = m.get("score", None)
+                try:
+                    if score is not None:
+                        score = float(score)
+                except Exception:
+                    score = None
+                norm_matches.append(
+                    {"id": m.get("id"), "score": score, "metadata": m.get("metadata")}
+                )
+            return norm_matches
     except Exception as e:
         logger.exception("Pinecone query request failed")
         raise HTTPException(status_code=502, detail="Pinecone query request failed") from e
@@ -273,6 +291,87 @@ def health_check():
 def websocket_help():
     """Documentation note for WebSocket support. Not implemented in this version."""
     return {"message": "No WebSocket endpoints available in this version. Use REST /chat for Q&A."}
+
+# PUBLIC_INTERFACE
+@app.post(
+    "/debug/rag-check",
+    tags=["chat"],
+    summary="Debug RAG retrieval and context formation",
+    description="Diagnose embeddings, Pinecone connectivity, and retrieved contexts for a given query without calling the LLM.",
+)
+async def rag_check(payload: ChatRequest = Body(...)) -> Dict[str, Any]:
+    """Debug endpoint to inspect query embedding dimension, Pinecone topK matches,
+    retrieved contexts, and whether contexts are empty (which would trigger fallback).
+
+    Parameters:
+    - query: The user query to debug (e.g., 'what is the hiring process of tcs?').
+    - top_k: Optional override for number of retrieved matches.
+
+    Returns:
+    - embedding_dim: dimension of the produced embedding
+    - top_k_used: integer topK used in the Pinecone request
+    - pinecone_host: host used for Pinecone REST
+    - matches_count: number of matches returned by Pinecone
+    - contexts_preview: first 2 contexts (trimmed) if present
+    - raw_matches: sanitized matches metadata (id, score, has_text)
+    """
+    q = (payload.query or "").strip()
+    if not q:
+        raise HTTPException(status_code=400, detail="Query is required")
+    k = int(payload.top_k or TOP_K)
+
+    # Embed
+    q_embs = await embed_texts([q])
+    if not q_embs or not q_embs[0]:
+        return {
+            "embedding_dim": 0,
+            "top_k_used": k,
+            "pinecone_host": PINECONE_HOST,
+            "matches_count": 0,
+            "contexts_preview": [],
+            "raw_matches": [],
+            "note": "Empty embedding produced; would fallback.",
+        }
+    q_emb = q_embs[0]
+
+    # Query Pinecone
+    matches = await _pinecone_query(q_emb, top_k=k)
+
+    # Collect contexts
+    contexts_texts: List[str] = []
+    raw: List[Dict[str, Any]] = []
+    for m in matches:
+        md = m.get("metadata") or {}
+        text = ""
+        if isinstance(md, dict):
+            text = (md.get("text") or "").strip()
+        else:
+            try:
+                parsed = json.loads(md)
+                text = (parsed.get("text", "") if isinstance(parsed, dict) else "").strip()
+            except Exception:
+                text = ""
+        has_text = bool(text)
+        if has_text:
+            contexts_texts.append(text)
+        raw.append({
+            "id": m.get("id"),
+            "score": m.get("score"),
+            "has_text": has_text,
+            "metadata_keys": list(md.keys()) if isinstance(md, dict) else "string",
+        })
+
+    preview = [t[:200] for t in contexts_texts[:2]]
+
+    return {
+        "embedding_dim": len(q_emb),
+        "top_k_used": k,
+        "pinecone_host": PINECONE_HOST,
+        "matches_count": len(matches),
+        "contexts_preview": preview,
+        "raw_matches": raw,
+        "would_fallback": len(contexts_texts) == 0,
+    }
 
 # PUBLIC_INTERFACE
 @app.post("/ingest", response_model=IngestResponse, tags=["ingestion"], summary="Ingest placement records", description="Embed and upsert placement records into Pinecone for retrieval.")

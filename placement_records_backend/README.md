@@ -62,11 +62,36 @@ Body:
 }
 Response includes `answer`, `contexts`, and `used_fallback`.
 
+- POST /debug/rag-check
+Body:
+{
+  "query": "what is the hiring process of tcs?",
+  "top_k": 3
+}
+Response shows embedding_dim, Pinecone host, matches_count, contexts_preview, and would_fallback for diagnosing retrieval and context formation.
+
 ## Notes
 
-- Embeddings: llama-text-embed-v2 via OpenRouter embeddings endpoint.
-- Generation: OpenRouter (model configurable). Default logic attempts a robust open model if the generic name is not found.
+- Embeddings: llama-text-embed-v2 via OpenRouter embeddings endpoint. You can override via `EMBEDDING_MODEL` in `.env`.
+- Generation: OpenRouter (model configurable). Default logic attempts a robust open model if the generic name is not found. You can override via `GENERATION_MODEL`.
 - Pinecone: This implementation uses direct REST calls and expects `PINECONE_HOST` for your index endpoint.
+
+### Troubleshooting retrieval (e.g., "TCS hiring process" falls back)
+1. Ensure .env is configured: `PINECONE_API_KEY`, `PINECONE_INDEX_NAME`, `PINECONE_HOST`, `OPENROUTER_API_KEY`.
+2. Verify embeddings service is reachable and returns vectors: call `POST /debug/rag-check` with:
+   {
+     "query": "what is the hiring process of tcs?",
+     "top_k": 3
+   }
+   - Check `embedding_dim` > 0.
+3. Verify Pinecone connectivity and results:
+   - Check `pinecone_host` present and `matches_count` >= 1.
+   - Inspect `raw_matches[*].has_text` is true to confirm stored `metadata.text` exists.
+4. If `matches_count` is 0 or all `has_text` false:
+   - Confirm you ingested records mentioning "TCS" or "Tata Consultancy Services" using `POST /ingest` and that metadata included the `text`.
+   - Consider ingesting variants (e.g., "TCS hiring process includes online test, interview...").
+5. If contexts are present but answer still falls back, the LLM may be ignoring context due to policy; confirm the `contexts_preview` contains relevant snippets and try re-asking.
+6. Confirm `top_k` is 3 (default) or increase for debugging.
 
 ## RAG Policy (Strict)
 
